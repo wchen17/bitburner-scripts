@@ -1,106 +1,115 @@
-let options;
-const argsSchema = [
-    ['github', 'wchen17'],
-    ['repository', 'bitburner-scripts'],
-    ['branch', 'main'],
-    ['download', []], // By default, all supported files in the repository will be downloaded. Override with just a subset of files here
-    ['new-file', []], // If a repository listing fails, only files returned by ns.ls() will be downloaded. You can add additional files to seek out here.
-    ['subfolder', ''], // Can be set to download to a sub-folder that is not part of the remote repository structure
-    ['extension', ['.js', '.ns', '.txt', '.script']], // Files to download by extension
-    ['omit-folder', ['Temp/']], // Folders to omit when getting a list of files to update (TODO: This may be obsolete now that we get a list of files from github itself.)
-];
-
-export function autocomplete(data, args) {
-    data.flags(argsSchema);
-    const lastFlag = args.length > 1 ? args[args.length - 2] : null;
-    if (["--download", "--subfolder", "--omit-folder"].includes(lastFlag))
-        return data.scripts;
-    return [];
-}
-
-/** @param {NS} ns
- * Will try to download a fresh version of every file on the current server.
- * You are responsible for:
- * - Backing up your save / scripts first (try `download *` in the terminal)
- * - Ensuring you have no local changes that you don't mind getting overwritten **/
+/** 
+ * git-pull.js (The Updater)
+ * 
+ * This script serves to synchronize your local Bitburner files with a remote GitHub repository.
+ * It dynamically fetches the list of files in the repository using the GitHub REST API and
+ * downloads them locally, ensuring that you always have the latest code.
+ * 
+ * Pedagogical Note: This script uses modern JavaScript features like `async/await`, `fetch`, 
+ * Arrow Functions, and the `try/catch` error handling block. 
+ * 
+ * @param {NS} ns - The Netscript 2.0 environment object, giving us access to Bitburner's functions.
+ */
 export async function main(ns) {
-    options = ns.flags(argsSchema);
-    // Once upon a time, the game API required folders to have a leading slash
-    // As of 2.3.1, not only is this no longer needed, but it can break the game.
-    options.subfolder = options.subfolder ? trimSlash(options.subfolder) : // Remove leading slash from any user-specified folder
-        ns.getScriptName().substring(0, ns.getScriptName().lastIndexOf('/')); // Default to the current folder
-    const baseUrl = `raw.githubusercontent.com/${options.github}/${options.repository}/${options.branch}/`;
-    const filesToDownload = options['new-file'].concat(options.download.length > 0 ? options.download : await repositoryListing(ns));
-    for (const localFilePath of filesToDownload) {
-        let fullLocalFilePath = pathJoin(options.subfolder, localFilePath);
-        const remoteFilePath = `https://` + pathJoin(baseUrl, localFilePath);
-        ns.print(`Trying to update "${fullLocalFilePath}" from ${remoteFilePath} ...`);
-        if (await ns.wget(`${remoteFilePath}?ts=${new Date().getTime()}`, fullLocalFilePath) && rewriteFileForSubfolder(ns, fullLocalFilePath))
-            ns.tprint(`SUCCESS: Updated "${fullLocalFilePath}" to the latest from ${remoteFilePath}`);
-        else
-            ns.tprint(`WARNING: "${fullLocalFilePath}" was not updated. (Currently running, or not located at ${remoteFilePath}?)`)
-    }
-    ns.tprint(`INFO: Pull complete. If you have any questions or issues, create an issue on github or join the ` +
-        `Bitburner Discord channel "#Insight's-scripts": https://discord.com/channels/415207508303544321/935667531111342200`);
-    // Remove any temp files / scripts from the prior version
-    ns.run(pathJoin(options.subfolder, `cleanup.js`));
-}
+    // Clear the terminal logs for a clean output when running the script
+    ns.clearLog();
+    // Disable default logging for `sleep` and `wget` to reduce console spam during mass downloads
+    ns.disableLog('sleep');
+    ns.disableLog('wget');
 
-/** Removes leading and trailing slashes from the specified string */
-function trimSlash(s) {
-    // Once upon a time, the game API required folders to have a leading slash
-    // As of 2.3.1, not only is this no longer needed, but it can break the game.
-    if (s.startsWith('/'))
-        s = s.slice(1);
-    if (s.endsWith('/'))
-        s = s.slice(0, -1);
-    return s;
-}
+    // --- Configuration ---
+    // Change these if you ever fork the repository or use a different branch.
+    // The target is hardcoded according to the requirements.
+    const githubUser = 'wchen17';
+    const repository = 'bitburner-scripts';
+    const branch = 'main';
 
-/** Joins all arguments as components in a path, e.g. pathJoin("foo", "bar", "/baz") = "foo/bar/baz" **/
-function pathJoin(...args) {
-    return trimSlash(args.filter(s => !!s).join('/').replace(/\/\/+/g, '/'));
-}
+    // The base URL used to construct the raw file download link.
+    // 'raw.githubusercontent.com' serves the raw text content of the files without the GitHub webpage UI.
+    const rawBaseUrl = `https://raw.githubusercontent.com/${githubUser}/${repository}/${branch}/`;
 
-/** @param {NS} ns
- * Rewrites a file with path substitions to handle downloading to a subfolder. **/
-export function rewriteFileForSubfolder(ns, path) {
-    if (!options.subfolder || path.includes('git-pull.js'))
-        return true;
-    let contents = ns.read(path);
-    // Replace subfolder reference in helpers.js getFilePath:
-    contents = contents.replace(`const subfolder = ''`, `const subfolder = '${options.subfolder}/'`);
-    // Replace any imports, which can't use getFilePath, but only if they don't specify a relative path (../)
-    contents = contents.replace(/from '(\.\/)?((?!\.\.\/).*)'/g, `from '${pathJoin(options.subfolder, '$2')}'`);
-    ns.write(path, contents, 'w');
-    return true;
-}
+    // The GitHub REST API endpoint to get a recursive tree of all files in the branch.
+    // 'recursive=1' forces GitHub to return the full directory structure in a single flat array.
+    // This is vastly superior to making separate API calls for every folder, thus saving our Rate Limit.
+    const apiUrl = `https://api.github.com/repos/${githubUser}/${repository}/git/trees/${branch}?recursive=1`;
 
-/** @param {NS} ns
- * Gets a list of files to download, either from the github repository (if supported), or using a local directory listing **/
-async function repositoryListing(ns, folder = '') {
-    // Note: Limit of 60 free API requests per day, don't over-do it
-    const listUrl = `https://api.github.com/repos/${options.github}/${options.repository}/contents/${folder}?ref=${options.branch}`
-    let response = null;
+    // Define the file extensions we are interested in downloading. 
+    // We filter out anything else (e.g. markdown (.md), images, json configs) to save time and space.
+    const validExtensions = ['.js', '.ns', '.txt'];
+
+    // --- Dynamic File Fetching via API ---
+    // We use a `try...catch` block here to gracefully handle potential API failures.
+    // The most common failure is hitting the GitHub API Rate Limit (60 requests per hour for unauthenticated IPs).
+    // `try` means "attempt to run this code block". If an error occurs inside `try` (like a network failure),
+    // execution jumps immediately to the `catch` block instead of crashing the script.
+    let filesToDownload = [];
     try {
-        response = await fetch(listUrl); // Raw response
-        // Expect an array of objects: [{path:"", type:"[file|dir]" },{...},...]
-        response = await response.json(); // Deserialized
-        // Sadly, we must recursively retrieve folders, which eats into our 60 free API requests per day.
-        const folders = response.filter(f => f.type == "dir").map(f => f.path);
-        let files = response.filter(f => f.type == "file").map(f => f.path)
-            .filter(f => options.extension.some(ext => f.endsWith(ext)));
-        ns.print(`The following files exist at ${listUrl}\n${files.join(", ")}`);
-        for (const folder of folders)
-            files = files.concat((await repositoryListing(ns, folder))
-                .map(f => `/${f}`)); // Game requires folders to have a leading slash
-        return files;
+        ns.print(`[INFO] Fetching repository structure from: ${apiUrl}`);
+
+        // `fetch` is a standard JavaScript function to make HTTP requests over the internet.
+        // It returns a "Promise", so we must `await` it to pause execution until the request finishes.
+        const response = await fetch(apiUrl);
+
+        // If the request failed (e.g., status 403 Rate Limit Exceeded or 404 Not Found),
+        // we throw an Error manually to force a jump to the `catch` block below.
+        if (!response.ok) {
+            throw new Error(`GitHub API responded with status: ${response.status} ${response.statusText}`);
+        }
+
+        // We `await response.json()` to parse the HTTP response from JSON text into a usable JavaScript object.
+        const data = await response.json();
+
+        // The API returns an object with a "tree" array containing all items (files, folders) in the repo.
+        // We chain an array `.filter()` and `.map()` to process this data:
+        filesToDownload = data.tree
+            // 1. Keep only files ("blob" is Git terminology for an actual file containing data, as opposed to a "tree"/folder)
+            .filter(item => item.type === "blob")
+            // 2. Keep only files whose path ends with one of our approved extensions
+            .filter(item => validExtensions.some(ext => item.path.endsWith(ext)))
+            // 3. Extract just the file path string (e.g., "helpers.js", "Tasks/backdoor.js")
+            .map(item => item.path);
+
+        ns.print(`[SUCCESS] Found ${filesToDownload.length} valid files to download.`);
     } catch (error) {
-        if (folder !== '') throw error; // Propagate the error if this was a recursive call.
-        ns.tprint(`WARNING: Failed to get a repository listing (GitHub API request limit of 60 reached?): ${listUrl}` +
-            `\nResponse Contents (if available): ${JSON.stringify(response ?? '(N/A)')}\nError: ${String(error)}`);
-        // Fallback, assume the user already has a copy of all files in the repo, and use it as a directory listing
-        return ns.ls('home').filter(name => options.extension.some(ext => f.endsWith(ext)) &&
-            !options['omit-folder'].some(dir => name.startsWith(dir)));
+        // If anything failed inside the `try` block, execution drops down to here.
+        ns.tprint(`[ERROR] Failed to fetch repository listing: ${error.message}`);
+        ns.tprint(`[INFO] This is usually caused by hitting the GitHub API limit (60 requests/hour).`);
+        ns.tprint(`       Please try again in a little while.`);
+        // We return early to strictly stop the script, as we don't have a list of files to iterate over.
+        return;
     }
+
+    // --- Download & Overwrite Logic ---
+    // Now that we have our list of valid files, we iterate over them.
+    // A `for...of` loop is the safest way to iterate an array when dealing with `await`ed asynchronous operations.
+    let successCount = 0;
+    for (const filePath of filesToDownload) {
+        // Construct the full URL to the raw file on GitHub
+        const remoteFilePath = rawBaseUrl + filePath;
+
+        // **Cache-Busting Mechanism**
+        // Browsers and internal game caches will often save previously downloaded files to save bandwidth.
+        // To force them to bypass the cache and fetch the latest version, we append a query parameter: `?ts=`
+        // By assigning `Date.now()` (the exact current time in milliseconds), the URL is always 100% unique.
+        const cacheBusterUrl = `${remoteFilePath}?ts=${Date.now()}`;
+
+        // `ns.wget` is a reliable Bitburner command that downloads from a URL and saves it to the local game drive.
+        // It returns a Promise<boolean> indicating whether the download naturally succeeded.
+        const success = await ns.wget(cacheBusterUrl, filePath);
+
+        if (success) {
+            ns.print(`[+] Overwritten/Created: ${filePath}`);
+            successCount++;
+        } else {
+            ns.print(`[!] Failed to download: ${filePath}`);
+            ns.tprint(`[ERROR] Failed to download/update: ${filePath}`);
+        }
+
+        // We pause for a microsecond (10ms) to yield the thread back to the game. 
+        // This prevents freezing the game UI if the file list is exceptionally large. 
+        await ns.sleep(10);
+    }
+
+    // Final user notification
+    ns.tprint(`[SUCCESS] git-pull.js update complete! Installed/Updated ${successCount} out of ${filesToDownload.length} files.`);
 }

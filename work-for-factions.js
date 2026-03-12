@@ -25,6 +25,7 @@ const argsSchema = [
     ['karma-threshold-for-gang-invites', -40000], // Prioritize working for gang invites once we have this much negative Karma
     ['disable-treating-gang-as-sole-provider-of-its-augs', false], // Set to true if you still want to grind for rep with factions that only have augs your gang provides
     ['no-bladeburner-check', false], // By default, will avoid working if bladeburner is active and "The Blade's Simulacrum" isn't installed
+    ['preserve-infiltration-multiplier', true], // Task 2: Do not actively train combat stats until priority runs are finished to maximize infiltration minigame rewards 
 ];
 
 // By default, consider these augs worth working towards regardless of whether they match one of the '--desired-stats'
@@ -246,6 +247,126 @@ async function loadStartupData(ns) {
 
 let lastMainLoopMessage = "";
 
+/**
+ * Executes a high-yield Infiltration minigame automatically.
+ * 
+ * @param {NS} ns - The Netscript API.
+ * @param {string} rewardGoal - "rep" or "money" - Determines which reward we select at the end.
+ * @param {string} factionName - If rewardGoal is "rep", the name of the faction to give the reputation to.
+ * @returns {Promise<boolean>} True if we successfully finished an infiltration.
+ */
+async function performInfiltration(ns, rewardGoal = "money", factionName = null) {
+    // 1. Configure the highest yield target location.
+    // ECorp in Aevum offers the highest base difficulty (level 15 security, 31 terminals) 
+    // which corresponds to the highest payout multiplier.
+    // You can easily change this to something smaller (e.g. "Iron Gym" in "Sector-12") if you want an easier/faster variant.
+    const targetCity = "Aevum";
+    const targetCompany = "ECorp";
+
+    // 2. Check if we need to travel to the target city to perform the infiltration.
+    const player = await getPlayerInfo(ns);
+    if (player.city !== targetCity) {
+        ns.print(`[INFILTRATION] Traveling to ${targetCity} to target ${targetCompany}.`);
+        ns.singularity.travelToCity(targetCity);
+    }
+
+    // 3. Trigger the Infiltration. This places the player into the 'Infiltration' screen.
+    ns.print(`[INFILTRATION] Starting infiltration against ${targetCompany}...`);
+    ns.singularity.infiltrateCompany(targetCompany);
+
+    // We add a brief delay to allow the game's internal DOM to render the 'Start Infiltration' button or minigame.
+    await ns.sleep(500);
+
+    // 4. Run the background DOM script that actively solves the minigames.
+    // 'autoinfiltrate.js' must exist and run continuously while on the screen.
+    const pid = ns.run("autoinfiltrate.js");
+    if (pid === 0) {
+        ns.print(`[ERROR] Failed to start autoinfiltrate.js! Make sure you have enough RAM and the script exists.`);
+        return false;
+    }
+
+    // 5. Polling Loop
+    // While the player is busy in the minigame (or while autoinfiltrate is running), we wait.
+    // A robust way to check is to poll as long as the infiltration script is still running,
+    // or as long as `ns.singularity.isBusy()` is true (though other scripts might focus).
+    ns.print(`[INFILTRATION] Minigame is active. Waiting for autoinfiltrate to complete...`);
+    while (ns.isRunning("autoinfiltrate.js")) {
+        // `await ns.sleep(1000)` is required inside while loops in Bitburner,
+        // otherwise it creates an "infinite loop" that will crash the browser tab!
+        await ns.sleep(1000);
+    }
+
+    // 6. Handling the Reward (DOM Manipulation)
+    // Once autoinfiltrate finishes, the game stays on the "Infiltration Successful" summary screen.
+    // We must interact with the Document Object Model (DOM) to click the correct reward button programmatically.
+    ns.print(`[INFILTRATION] Minigame completed. Determining reward (${rewardGoal})...`);
+
+    // Global `document` represents the HTML of the Bitburner page.
+    // We use eval to bypass static RAM checkers hiding the 'document' object (common in older BB versions).
+    const doc = eval("document");
+
+    // We give the the reward screen 1 second to fully render.
+    await ns.sleep(1000);
+
+    // Grab all <button> elements currently on the screen.
+    const buttons = Array.from(doc.querySelectorAll("button"));
+
+    if (rewardGoal === "rep" && factionName) {
+        ns.print(`[INFILTRATION] Attempting to trade for ${factionName} reputation...`);
+        try {
+            // Find the button that handles trading for rep. It typically contains text like "Trade for"
+            const tradeButton = buttons.find(b => b.innerText && b.innerText.toLowerCase().includes("trade for") && b.innerText.toLowerCase().includes("rep"));
+            if (tradeButton) {
+                // Task 1: React Dropdown DOM Hack
+                // Before clicking, we must first change the faction dropdown to match 'factionName'.
+                // Because of React's synthetic event system, just setting .value is ignored by the state manager.
+                const selectEl = doc.querySelector("select");
+                if (selectEl) {
+                    const optionEl = Array.from(selectEl.options).find(opt => opt.text === factionName);
+                    if (optionEl) {
+                        // Bypass React's properties by invoking the native HTMLSelectElement setter
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set;
+                        nativeInputValueSetter.call(selectEl, optionEl.value);
+                        // Dispatch a native 'change' event so React sees the update
+                        selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+                        ns.print(`[INFILTRATION] Selected ${factionName} from the Dropdown.`);
+                    }
+                }
+
+                // Now invoke the React button click handler
+                const propsKey = Object.keys(tradeButton).find(k => k.startsWith("__reactProps"));
+                tradeButton[propsKey].onClick({ isTrusted: true });
+                ns.print(`[SUCCESS] Traded infiltration for Reputation!`);
+            } else {
+                ns.print(`[ERROR] Could not find the 'Trade for Reputation' button on screen.`);
+            }
+        } catch (e) {
+            ns.print(`[ERROR] DOM Manipulation for Rep Trade failed: ${e}`);
+        }
+    } else {
+        // If rewardGoal === "money"
+        ns.print(`[INFILTRATION] Attempting to sell secrets for Money...`);
+        try {
+            // Find the button that handles selling for money. It typically contains "Sell for".
+            const sellButton = buttons.find(b => b.innerText && b.innerText.toLowerCase().includes("sell for"));
+            if (sellButton) {
+                // Again, accessing the React properties to robustly execute the click.
+                const propsKey = Object.keys(sellButton).find(k => k.startsWith("__reactProps"));
+                sellButton[propsKey].onClick({ isTrusted: true });
+                ns.print(`[SUCCESS] Sold infiltration secrets for Money!`);
+            } else {
+                ns.print(`[ERROR] Could not find the 'Sell for Money' button on screen.`);
+            }
+        } catch (e) {
+            ns.print(`[ERROR] DOM Manipulation for Money Trade failed: ${e}`);
+        }
+    }
+
+    // Wait for the UI to transition back to the character screen before yielding
+    await ns.sleep(1000);
+    return true;
+}
+
 /** @param {NS} ns */
 async function mainLoop(ns) {
     if (!breakToMainLoop()) scope++; // Increase the scope of work if the last iteration completed early (i.e. due to all work within that scope being complete)
@@ -294,6 +415,17 @@ async function mainLoop(ns) {
     if (wasGrafting) {
         await loadStartupData(ns);
         wasGrafting = false;
+    }
+
+    // -- Infiltration Intercept 1: Low Funds (< $500 Billion) --
+    // We check the player's funds. If it's critically low, we suspend all standard work logic
+    // and launch a high-yield Infiltration minigame, redeeming it for money.
+    if (player.money < 500e9) {
+        ns.print(`[PRIORITY] Player funds (${formatMoney(player.money)}) < $500B. Prioritizing Infiltration for money.`);
+        // By 'awaiting' it, we pause the main loop here until infiltration is fully complete.
+        await performInfiltration(ns, "money");
+        // Returning from mainLoop will simply end this iteration, and main() will call mainLoop() again next tick.
+        return;
     }
 
     // Remove Fulcrum from our "EarlyFactionOrder" if hack level is insufficient to backdoor their server
@@ -387,12 +519,12 @@ async function mainLoop(ns) {
             `with highest-favor faction: ${mostFavorFaction} (${(dictFactionFavors[mostFavorFaction] || 0).toFixed(2)} favor)`);
         foundWork = await workForSingleFaction(ns, mostFavorFaction, false, false, targetRep);
     }
-    if (!foundWork && !options['no-crime']) { // Otherwise, kill some time by doing crimes for a little while
-        ns.print(`INFO: Nothing to do. Doing a little crime...`);
-        await crimeForKillsKarmaStats(ns, 0, -ns.heart.break() + 1000 /* Hack: Decrease Karma by 1000 */, 0);
-    } else if (!foundWork) { // If our hands our tied, twiddle our thumbs a bit
-        ns.print(`INFO: Nothing to do. Sleeping for 30 seconds to see if magically we join a faction`);
-        await ns.sleep(30000);
+    if (!foundWork) {
+        // -- Infiltration Intercept 3: Idle / Fallback --
+        // In the original script if 'foundWork' was false, it would do passive crime or sleep.
+        // We override this to default to Infiltration for money, as there is "nothing better or more effective to do."
+        ns.print(`[PRIORITY] Idle/Fallback triggered (no priority work to do). Defaulting to Infiltration.`);
+        await performInfiltration(ns, "money");
     }
     if (scope <= 9) scope--; // Cap the 'scope' value from increasing perpetually when we're on our last strategy
 }
@@ -470,6 +602,12 @@ async function earnFactionInvite(ns, factionName) {
     else if (deficientStats.length > 0) {
         ns.print(`${reasonPrefix} you have insufficient combat stats. Need: ${requirement} of each, Have ` +
             physicalStats.map(s => `${s.slice(0, 3)}: ${player.skills[s]}`).join(", "));
+
+        // Task 2: Infiltration Multiplier Strategy (Stat Limiter Toggle)
+        if (options && options['preserve-infiltration-multiplier']) {
+            return ns.print(`${reasonPrefix} Skipping training combat stats to preserve the high Infiltration Multiplier (--preserve-infiltration-multiplier).`);
+        }
+
         const em = requirement / options['training-stat-per-multi-threshold'];
         // Hack: Create a rough heuristic suggesting how much multi we need to train physical stats in a reasonable amount of time.
         // TODO: Be smarter (time-based decision), and also consider whether training physical stats via GYM might be faster
@@ -626,8 +764,15 @@ export async function crimeForKillsKarmaStats(ns, reqKills, reqKarma, reqStats, 
     if (reqKarma) strRequirements.push(() => `-${reqKarma} Karma (Have ${Math.round(ns.heart.break()).toLocaleString('en')})`);
     if (reqStats) strRequirements.push(() => `${reqStats} of each combat stat (Have ` +
         `Str: ${player.skills.strength}, Def: ${player.skills.defense}, Dex: ${player.skills.dexterity}, Agi: ${player.skills.agility})`);
-    let anyStatsDeficient = (p) => p.skills.strength < reqStats || p.skills.defense < reqStats ||
-        /*                      */ p.skills.dexterity < reqStats || p.skills.agility < reqStats;
+
+    // Task 2: Infiltration Multiplier Strategy (Stat Limiter Toggle)
+    // If we're preserving our multiplier, we shouldn't grind crimes *just* for stats
+    let anyStatsDeficient = (p) => {
+        if (options && options['preserve-infiltration-multiplier']) return false;
+        return p.skills.strength < reqStats || p.skills.defense < reqStats ||
+            p.skills.dexterity < reqStats || p.skills.agility < reqStats;
+    };
+
     let crime, lastCrime, crimeTime, lastStatusUpdateTime, needStats;
     while (forever || (needStats = anyStatsDeficient(player)) || player.numPeopleKilled < reqKills || -ns.heart.break() < reqKarma) {
         if (!forever && breakToMainLoop()) return ns.print('INFO: Interrupting crime to check on high-level priorities.');
@@ -955,26 +1100,25 @@ export async function workForSingleFaction(ns, factionName, forceUnlockDonations
             workAssigned = false;
             if (!options['no-tail-windows']) tail(ns); // Force a tail window open to help the user kill this script if they accidentally closed the tail window and don't want to keep working
         }
-        // Periodically check again what the best faction work is (may change with stats over time)
-        if ((Date.now() - lastStatusUpdateTime) > statusUpdateInterval)
-            workAssigned = false; // This will force us to redetermine the best faction work.
-        // Heads up! Current implementation of "detectBestFactionWork" changes the work currently being done, so we must always re-assign work afterwards
-        if (!workAssigned)
-            bestFactionJob = await detectBestFactionWork(ns, factionName);
-        // For purposes of being informative, log a message if the detected "bestFactionJob" is different from what we were previously doing
-        if (currentWork.factionName == factionName && factionJob != bestFactionJob) {
-            log(ns, `INFO: Detected that "${bestFactionJob}" gives more rep than previous work "${factionJob}". Switching...`);
-            workAssigned = false;
-        }
-        // Ensure we are doing the best faction work (must always be done after "detect" routine is run)
+
         if (!workAssigned) {
-            if (await startWorkForFaction(ns, factionName, bestFactionJob, shouldFocus)) {
-                workAssigned = true;
-                if (shouldFocus && !options['no-tail-windows']) tail(ns); // Keep a tail window open if we're stealing focus
-            } else {
-                log(ns, `ERROR: Something went wrong, failed to start "${bestFactionJob}" work for faction "${factionName}" (Is gang faction, or not joined?)`, false, 'error');
+            // -- Infiltration Intercept 2: Faction Reputation --
+            // Instead of evaluating the best passive work via `detectBestFactionWork` and using `startWorkForFaction`, 
+            // we override and exclusively choose Infiltration for maximum reputation yield.
+            ns.print(`[PRIORITY] Overriding passive work for ${factionName} with Infiltration!`);
+            await performInfiltration(ns, "rep", factionName);
+            workAssigned = true;
+
+            // Task 3: Exorbitant Rep Routing
+            // Infiltrations provide an exorbitant amount of reputation.
+            // Wait for the UI to clear and immediately update reputation.
+            await ns.sleep(2000);
+            currentReputation = await getFactionReputation(ns, factionName);
+            if (currentReputation >= factionRepRequired) {
+                ns.print(`[SUCCESS] Exorbitant reputation acquired. Skipping further work loop.`);
                 break;
             }
+            continue;
         }
 
         let status = `Doing '${bestFactionJob}' work for "${factionName}" until ${Math.round(factionRepRequired).toLocaleString('en')} rep.`;
